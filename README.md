@@ -1,5 +1,5 @@
 # nzkfc_drone
-A deployable drone resource for FiveM using the **Qbox** framework. Players can deploy a personal drone that follows them, provides healing and can be flown manually in FPV mode.
+A deployable drone resource for FiveM. Supports **Qbox**, **QBCore** and **ESX** frameworks. Players can deploy a personal drone that follows them, provides healing and can be flown manually in FPV mode.
 
 Licensed under **GNU GPL v3** — free to use, modify and share. Commercial sale is prohibited.
 
@@ -23,8 +23,10 @@ Licensed under **GNU GPL v3** — free to use, modify and share. Commercial sale
 - **Battery Removal** — Removing the battery mid-flight causes the drone to drop and power down. Reinserting a battery brings it back to life automatically.
 - **Unique Serial Numbers** — Each drone is assigned a unique serial `DRN-XXXXXX` on first use, stored in item metadata. Visible in your inventory.
 - **Collision Detection** — FPV control includes raycast-based collision detection to prevent flying through walls and terrain.
+- **Spotlight** — A toggleable front-mounted spotlight, controllable from the target menu or via `L` in FPV mode. Angle, colour, brightness, distance and cone width are all configurable.
 - **Native GTA Audio** — Uses GTA's built-in `DLC_BTL_Drone_Sounds` audio bank. No external sound files required.
-- **Fully Configurable** — All behaviour, offsets, speeds, battery drain, healing settings and more are in a single `config.lua`.
+- **Multi-Framework Support** — Auto-detects Qbox, QBCore and ESX at runtime. No manual framework configuration required.
+- **Fully Configurable** — All behaviour, offsets, speeds, battery drain, healing settings, spotlight settings and more are in a single `config.lua`.
 
 ---
 
@@ -32,11 +34,22 @@ Licensed under **GNU GPL v3** — free to use, modify and share. Commercial sale
 
 | Resource | Notes |
 |---|---|
-| [qbx_core](https://github.com/Qbox-project/qbx_core) | Framework |
 | [ox_inventory](https://github.com/overextended/ox_inventory) | Inventory (2.45.0+) |
 | [ox_lib](https://github.com/overextended/ox_lib) | UI notifications and animations |
-| [ox_target](https://github.com/overextended/ox_target) | Drone interaction targeting |
+| [ox_target](https://github.com/communityox/ox_target) | Drone interaction targeting — **must be the communityox fork** |
 | [oxmysql](https://github.com/overextended/oxmysql) | Database (used by ox_inventory) |
+
+### Framework (one of)
+
+| Resource | Notes |
+|---|---|
+| [qbx_core](https://github.com/Qbox-project/qbx_core) | Qbox |
+| [qb-core](https://github.com/qbcore-framework/qb-core) | QBCore |
+| [es_extended](https://github.com/esx-framework/esx_core) | ESX |
+
+> **ESX note:** ox_lib, ox_inventory, ox_target and oxmysql are not included in a standard ESX installation and must be added separately.
+
+> **ox_target note:** This resource requires the [communityox fork](https://github.com/communityox/ox_target) of ox_target. The archived overextended version does not support the `disableTargeting` export used to prevent menu access while the player is downed.
 
 ---
 
@@ -44,7 +57,7 @@ Licensed under **GNU GPL v3** — free to use, modify and share. Commercial sale
 
 ### 1. Add the resource
 
-Drop the `nzkfc_drone` folder into your `resources` directory (or in whatever subfolder you want) and add the following to your `server.cfg`:
+Drop the `nzkfc_drone` folder into your `resources` directory and add the following to your `server.cfg`:
 
 ```
 ensure nzkfc_drone
@@ -65,7 +78,7 @@ Open `ox_inventory/data/items.lua` and add the following entries:
     limit       = 1,
     description = 'A deployable drone.',
     client      = {
-        export = 'nzkfc_drone.useDrone'
+        event = 'nzkfc_drone:useItem'
     }
 },
 ['drone_battery'] = {
@@ -85,6 +98,8 @@ Open `ox_inventory/data/items.lua` and add the following entries:
     description = 'Empty battery for a drone. Might be worth something?',
 },
 ```
+
+> **Note:** Use `event = 'nzkfc_drone:useItem'` rather than `export = 'nzkfc_drone.useDrone'` to avoid load order race conditions.
 
 ### 3. Add item images to ox_inventory
 
@@ -121,13 +136,14 @@ Using an admin command:
 | Option | Description |
 |---|---|
 | **Drone Storage** | Open the drone's personal stash inventory |
-| **Activate Healing** | Toggle healing aura for nearby players |
 | **Check Battery** | Display current battery percentage |
-| **Tell Drone to Stay** | Park the drone at its current position |
+| **Guard Mode** | Shoots any player, NPC or animal that enters the configured radius |
+| **Activate Healing** | Toggle healing aura for nearby players |
 | **Take Control** | Enter FPV control mode |
 | **Drone Flip** | Perform a 360° flip trick |
-| **Guard Mode** | Turns on a radius circle that shoots any player, NPC or animal that walks in (configurable!)
-| **Mute Sound** | Turn off drone motor sounds (can get annoying)
+| **Tell Drone to Stay** | Park the drone at its current position |
+| **Toggle Motor Sound** | Mute/unmute drone motor sounds |
+| **Toggle Spotlight** | Turn the front-mounted spotlight on or off |
 
 ### FPV Control Mode
 
@@ -140,13 +156,30 @@ Using an admin command:
 | `Q` | Ascend |
 | `E` | Descend |
 | `Mouse` | Look / Yaw |
+| `L` | Toggle spotlight |
 | `Space` | Disconnect and return to player |
 
 ---
 
 ## Configuration
 
-All settings are in `shared/config.lua`.
+All settings are in `shared/config.lua`. The framework is auto-detected at runtime — no manual configuration is required. To override the detected framework, uncomment and set the following line at the top of `config.lua`:
+
+```lua
+-- Config.Framework = 'qbx'  -- 'qbx', 'qbcore', or 'esx'
+```
+
+### Spotlight options
+
+| Option | Default | Description |
+|---|---|---|
+| `Config.LightEnabled` | `true` | Enable/disable the spotlight feature entirely |
+| `Config.LightR/G/B` | `255, 245, 200` | Beam colour (warm white) |
+| `Config.LightDistance` | `25.0` | How far the beam reaches in metres |
+| `Config.LightBrightness` | `5.0` | Beam intensity |
+| `Config.LightRadius` | `20.0` | Cone width in degrees |
+| `Config.LightFalloff` | `5.0` | Edge softness |
+| `Config.LightAngle` | `45.0` | Downward tilt in degrees (0 = straight ahead, 90 = straight down) |
 
 ---
 
