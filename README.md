@@ -1,7 +1,7 @@
 # nzkfc_drone
-A deployable drone resource for FiveM. Supports **Qbox**, **QBCore** (should do) frameworks. Players can deploy a personal drone that follows them, provides features like healing, guard mode and can be flown manually in FPV mode.
+A deployable drone resource for FiveM. Supports **Qbox**, **QBCore** (should do) and ESX (running ox/ox_inventory etc) frameworks. Players can deploy a personal drone that follows them, provides features like healing, guard mode and can be flown manually in FPV mode.
 
-**Note: ESX will not get full features like the qbox one does, I don't have any interest in ESX and can't be bothered adding support for it. I do have a branch which runs v1.0.2 (pre dmg fix and lights) that you can use, but requires ESX running ox_inventory. If you wish to update from main for ESX, please feel free to PR it and I will merge it in and add credits <3**
+**NOTE: THIS WILL NOT RUN ON A DEFAULT ESX SERVER - You must have ESX running off ox_inventory and the other ox resources that needs that, more info here: https://coxdocs.dev/ox_inventory/Frameworks/esx
 
 Licensed under **GNU GPL v3** — free to use, modify and share. Commercial sale is prohibited.
 
@@ -27,7 +27,7 @@ Licensed under **GNU GPL v3** — free to use, modify and share. Commercial sale
 - **Collision Detection** — FPV control includes raycast-based collision detection to prevent flying through walls and terrain.
 - **Spotlight** — A toggleable front-mounted spotlight, controllable from the target menu or via `L` in FPV mode. Angle, colour, brightness, distance and cone width are all configurable.
 - **Native GTA Audio** — Uses GTA's built-in `DLC_BTL_Drone_Sounds` audio bank. No external sound files required.
-- **Fully Configurable** — All behaviour, offsets, speeds, battery drain, healing settings, spotlight settings and more are in a single `config.lua`.
+- **Fully Configurable** — All behaviour, offsets, speeds, battery drain, healing settings, spotlight settings, Job restrictions and more are in a single `config.lua`.
 
 ---
 
@@ -46,6 +46,7 @@ Licensed under **GNU GPL v3** — free to use, modify and share. Commercial sale
 |---|---|
 | [qbx_core](https://github.com/Qbox-project/qbx_core) | Qbox |
 | [qb-core](https://github.com/qbcore-framework/qb-core) | QBCore |
+| [esx](https://github.com/orgs/esx-framework/ ) | ESX |
 
 ---
 
@@ -66,33 +67,28 @@ Open `ox_inventory/data/items.lua` and add the following entries:
 ```lua
 -- nzkfc_drone
 ['drone'] = {
-    label       = 'Drone',
-    weight      = 2000,
-    stack       = false,
-    close       = true,
-    consume     = 0,
-    limit       = 1,
-    description = 'A deployable drone.',
-    client      = {
-        export = 'nzkfc_drone:useItem'
-    }
-},
-['drone_battery'] = {
-    label       = 'Drone Battery',
-    weight      = 300,
-    stack       = false,
-    close       = true,
-    consume     = 0,
-    description = 'Battery for a drone. Place inside the drone storage to power it.',
-},
-['drone_battery_empty'] = {
-    label       = 'Empty Drone Battery',
-    weight      = 300,
-    stack       = false,
-    close       = true,
-    consume     = 0,
-    description = 'Empty battery for a drone. Might be worth something?',
-},
+		label = 'Drone',
+		weight = 800,
+		stack = false,   -- each drone has its own serial/metadata
+		close = true,
+		client = {
+			event = 'nzkfc_drone:useItem',
+		},
+	},
+
+	['drone_battery'] = {
+		label = 'Drone Battery',
+		weight = 200,
+		stack = false,   -- each battery tracks charge in metadata
+		close = true,
+	},
+
+	['drone_battery_empty'] = {
+		label = 'Drone Battery (Empty)',
+		weight = 200,
+		stack = true,
+		close = true,
+	},
 ```
 
 ### 3. Add item images to ox_inventory
