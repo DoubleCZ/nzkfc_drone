@@ -1,5 +1,3 @@
--- Handles first-person drone control mode (FPV)
-
 DroneControl = {}
 
 local controlling    = false
@@ -19,13 +17,21 @@ local KEY = {
 
 -- E key descend — use RegisterKeyMapping to avoid control index conflicts
 local eKeyHeld = false
--- +/- command pair tracks held state of the E key for descend
 RegisterCommand('+drone_descend', function() eKeyHeld = true  end, false)
 RegisterCommand('-drone_descend', function() eKeyHeld = false end, false)
 RegisterKeyMapping('+drone_descend', 'Drone: Descend (hold E)', 'keyboard', 'e')
 
+local lightKeyPressed = false
+RegisterCommand('+drone_light', function()
+    if controlling and Config.LightEnabled then
+        DroneMain.ToggleLight()
+    end
+end, false)
+RegisterCommand('-drone_light', function() end, false)
+RegisterKeyMapping('+drone_light', 'Drone: Toggle Spotlight', 'keyboard', 'l')
+
 local function applyTimecycleEffect()
-    SetTimecycleModifier('heliGunCam')
+    SetTimecycleModifier('heliGunCamMP')
     SetTimecycleModifierStrength(1.0)
 end
 
@@ -65,7 +71,7 @@ function DroneControl.Start(droneEntity, startPos)
     -- Show control hint
     lib.notify({ type = 'inform', title = 'Drone Control', description = 'W/S/A/D = Move | Q = Up | E = Down | SPACE = Disconnect' })
 
-    -- Hide player ped
+    -- Hide player ped (disabled)
     --SetEntityVisible(PlayerPedId(), false, false)
 
     local cam = getFovCam(droneEntity)
@@ -85,6 +91,12 @@ function DroneControl.Start(droneEntity, startPos)
                 break
             end
 
+            -- Stop control if player dies
+            if IsPedDeadOrDying(PlayerPedId(), true) then
+                DroneControl.Stop(droneEntity)
+                break
+            end
+
             -- Disconnect
             if IsDisabledControlJustPressed(0, KEY.SPACE) then
                 DroneControl.Stop(droneEntity)
@@ -92,7 +104,8 @@ function DroneControl.Start(droneEntity, startPos)
             end
 
             -- Movement
-            local heading = GetEntityHeading(droneEntity)
+            -- Subtract 180 to get the logical heading before the visual offset
+            local heading = GetEntityHeading(droneEntity) - 180.0
             local rad     = math.rad(-heading)
             local cosH    = math.cos(rad)
             local sinH    = math.sin(rad)
@@ -163,7 +176,7 @@ function DroneControl.Start(droneEntity, startPos)
 
             -- Camera pitch: mouse vertical
             camPitch = math.max(-89.0, math.min(89.0, camPitch + GetDisabledControlNormal(0, 2) * -Config.ControlPitchSensitivity))
-            SetCamRot(cam, camPitch, 0.0, newH, 2)
+            SetCamRot(cam, camPitch, 0.0, newH + 180.0, 2)
 
             -- Suppress normal controls so player doesn't move
             DisableAllControlActions(0)
@@ -184,6 +197,11 @@ end
 function DroneControl.Stop(droneEntity)
     if not controlling then return end
     controlling = false
-    --SetEntityVisible(PlayerPedId(), true, false)
+    if Config.ControlStayOnExit then
+        -- Park the drone at its current position instead of resuming follow behaviour.
+        -- DroneMain.SetStay exposes the droneStaying/stayPos upvalues in main.lua.
+        DroneMain.SetStay(true, GetEntityCoords(droneEntity))
+    end
+    --SetEntityVisible(PlayerPedId(), true, false) --Disabled
     lib.notify({ type = 'success', title = 'Drone', description = 'Disconnected from drone.' })
 end

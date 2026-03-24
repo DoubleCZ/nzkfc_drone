@@ -1,6 +1,19 @@
--- ─── State ────────────────────────────────────────────────────────────────────
 local droneEntity   = nil
 local droneActive   = false
+local droneLight    = false -- *tap tap* "Is this thing on?"
+
+DroneMain = {}
+function DroneMain.ToggleLight()
+    droneLight = not droneLight
+    local state = droneLight and 'on' or 'off'
+    lib.notify({ type = 'inform', title = 'Drone', description = ('Spotlight %s.'):format(state) })
+end
+-- Allow drone_control.lua to park the drone in place after FPV disconnect.
+-- Called by DroneControl.Stop when Config.ControlStayOnExit is true.
+function DroneMain.SetStay(state, pos)
+    droneStaying = state
+    stayPos      = pos
+end
 local droneSerial   = nil
 local droneHealth   = Config.DroneMaxHealth
 local droneItemSlot = nil
@@ -9,6 +22,7 @@ local droneStaying  = false     -- true = drone is parked, not following
 local stayPos       = nil       -- position drone is staying at
 
 local healActive    = false     -- true while heal mode is activated
+local guardActive   = false     -- true while guard mode is activated
 local droneGrounded = false     -- true when battery dead and drone is sitting on ground
 local droneWrecked  = false     -- true when drone is destroyed (health=0), storage still accessible
 
@@ -31,14 +45,13 @@ local startDamageThread
 local startMainThread
 local startBatteryThread
 
--- ─── Sounds ───────────────────────────────────────────────────────────────────
--- Uses GTA native audio from DLC_BTL_Drone_Sounds.
--- Flight_Loop is played attached to the drone entity so it moves with it
--- and is positional/audible to nearby players via GTA's own audio engine.
+-- Sounds
 
-local flySoundId = -1  -- handle for the looping flight sound
+local flySoundId      = -1     -- handle for the looping flight sound
+local flightSoundMuted = not Config.FlightSoundEnabled  -- toggled via target menu
 
 local function startFlySound(entity)
+    if flightSoundMuted then return end  -- player has muted the motor sound
     -- Stop any previous instance first
     if flySoundId ~= -1 then
         StopSound(flySoundId)
@@ -47,6 +60,9 @@ local function startFlySound(entity)
     end
     flySoundId = GetSoundId()
     PlaySoundFromEntity(flySoundId, 'Flight_Loop', entity, 'DLC_BTL_Drone_Sounds', false, 0)
+    -- Notify other nearby clients so they hear the drone too
+    local netId = NetworkGetNetworkIdFromEntity(entity)
+    TriggerServerEvent('nzkfc_drone:startSound', netId)
 end
 
 local function stopFlySound()
@@ -55,7 +71,130 @@ local function stopFlySound()
         ReleaseSoundId(flySoundId)
         flySoundId = -1
     end
+    -- Notify other nearby clients to stop the sound
+    if droneEntity and DoesEntityExist(droneEntity) then
+        local netId = NetworkGetNetworkIdFromEntity(droneEntity)
+        TriggerServerEvent('nzkfc_drone:stopSound', netId)
+    end
 end
+
+-- Other players' drone sounds: keyed by netId so we can stop them cleanly
+local remoteSounds = {}
+
+-- Remote drone position interpolation.
+-- Keyed by netId: stores the latest received target position.
+-- A per-drone lerp thread smoothly moves the entity toward it each frame.
+local remoteTargets = {}  -- [netId] = {x, y, z, h}
+local remoteThreads = {}  -- [netId] = true (thread running)
+
+RegisterNetEvent('nzkfc_drone:recvPos', function(netId, x, y, z, h)
+    -- Ignore updates for our own drone (we set its position directly)
+    if droneEntity and DoesEntityExist(droneEntity) then
+        local ownNetId = NetworkGetNetworkIdFromEntity(droneEntity)
+        if ownNetId == netId then return end
+    end
+
+    remoteTargets[netId] = {x = x, y = y, z = z, h = h}
+
+    -- Spawn a lerp thread for this drone if one isn't already running
+    if not remoteThreads[netId] then
+        remoteThreads[netId] = true
+        CreateThread(function()
+            -- Wait for entity to be streamed in
+            local entity = nil
+            local t = 0
+            while t < 100 do
+                entity = NetworkGetEntityFromNetworkId(netId)
+                if entity and entity ~= 0 and DoesEntityExist(entity) then break end
+                Wait(100)
+                t = t + 1
+            end
+
+            if not entity or not DoesEntityExist(entity) then
+                remoteThreads[netId] = nil
+                return
+            end
+
+            -- Lerp loop — runs until we stop receiving updates for this drone
+            local lastUpdate = GetGameTimer()
+            while true do
+                Wait(0)
+                local target = remoteTargets[netId]
+                if not target then break end
+
+                -- Stop if no update received for 3 seconds (drone packed/destroyed)
+                if GetGameTimer() - lastUpdate > 3000 then break end
+
+                if DoesEntityExist(entity) then
+                    local cur = GetEntityCoords(entity)
+                    local curH = GetEntityHeading(entity)
+
+                    -- Adaptive lerp speed: faster when further away to catch up,
+                    -- slower when close to stay smooth
+                    local dist = #(vector3(cur.x, cur.y, cur.z) - vector3(target.x, target.y, target.z))
+                    local speed = math.min(0.3 + dist * 0.15, 1.0)
+
+                    local nx = cur.x + (target.x - cur.x) * speed
+                    local ny = cur.y + (target.y - cur.y) * speed
+                    local nz = cur.z + (target.z - cur.z) * speed
+
+                    -- Heading lerp (handle wrap-around)
+                    local dh = target.h - curH
+                    if dh > 180 then dh = dh - 360 elseif dh < -180 then dh = dh + 360 end
+                    local nh = curH + dh * speed
+
+                    SetEntityCoords(entity, nx, ny, nz, false, false, false, false)
+                    SetEntityHeading(entity, nh)
+                    SetEntityVelocity(entity, 0.0, 0.0, 0.0)
+                end
+
+                -- Update lastUpdate timestamp each time we get a fresh target
+                if remoteTargets[netId] ~= target then
+                    lastUpdate = GetGameTimer()
+                end
+            end
+
+            remoteTargets[netId] = nil
+            remoteThreads[netId] = nil
+        end)
+    else
+        -- Thread already running — just update the timestamp tracker
+    end
+end)
+
+-- Clean up remote lerp state when a drone's sound stops (drone gone)
+local _origStopRemote = nil
+
+RegisterNetEvent('nzkfc_drone:playRemoteSound', function(netId)
+    if remoteSounds[netId] then return end  -- already playing
+    CreateThread(function()
+        -- Wait for entity to exist on this client
+        local entity = nil
+        local t = 0
+        while t < 100 do
+            entity = NetworkGetEntityFromNetworkId(netId)
+            if entity and entity ~= 0 and DoesEntityExist(entity) then break end
+            Wait(100)
+            t = t + 1
+        end
+        if not entity or not DoesEntityExist(entity) then return end
+        local id = GetSoundId()
+        remoteSounds[netId] = id
+        PlaySoundFromEntity(id, 'Flight_Loop', entity, 'DLC_BTL_Drone_Sounds', false, 0)
+    end)
+end)
+
+RegisterNetEvent('nzkfc_drone:stopRemoteSound', function(netId)
+    local id = remoteSounds[netId]
+    if id then
+        StopSound(id)
+        ReleaseSoundId(id)
+        remoteSounds[netId] = nil
+    end
+    -- Clear lerp state for this drone
+    remoteTargets[netId] = nil
+    remoteThreads[netId] = nil
+end)
 
 local function playOneshot(soundName)
     local id = GetSoundId()
@@ -67,7 +206,7 @@ local function playOneshot(soundName)
     end)
 end
 
--- ─── Helpers ─────────────────────────────────────────────────────────────────
+-- Helpers
 
 -- Blocking kneel: plays anim and waits for it to finish.
 local function kneelAnimation(duration)
@@ -104,13 +243,15 @@ local function spawnDroneProp(pos)
         return nil
     end
 
-    local ent = CreateObject(model, pos.x, pos.y, pos.z, false, false, false)
-    -- Keep collision ON so ox_target raycast can hit the entity
-    -- but disable it from pushing the player around
+    local ent = CreateObject(model, pos.x, pos.y, pos.z, true, true, true)
+    SetEntityAsMissionEntity(ent, true, true)
+    NetworkRequestControlOfEntity(ent)
     SetEntityCollision(ent, true, false)
     SetEntityInvincible(ent, true)
     SetEntityCanBeDamaged(ent, false)
-    -- Don't use FreezeEntityPosition — we manually set coords every tick instead
+    -- Disable gravity so the entity doesn't fall between our coord updates.
+    -- We control position entirely via SetEntityCoords each tick.
+    SetEntityHasGravity(ent, false)
     SetModelAsNoLongerNeeded(model)
     return ent
 end
@@ -144,22 +285,20 @@ local function swapDroneProp(newModel)
     while not HasModelLoaded(model) and t < 200 do Wait(10); t = t + 1 end
     if not HasModelLoaded(model) then return end
 
-    local ent = CreateObject(model, pos.x, pos.y, pos.z, false, false, false)
+    local ent = CreateObject(model, pos.x, pos.y, pos.z, true, true, true)
+    SetEntityAsMissionEntity(ent, true, true)
+    NetworkRequestControlOfEntity(ent)
     SetEntityCollision(ent, true, false)
     SetEntityInvincible(ent, true)
     SetEntityCanBeDamaged(ent, false)
+    SetEntityHasGravity(ent, false)
     SetEntityRotation(ent, rot.x, rot.y, rot.z, 2, true)
     SetModelAsNoLongerNeeded(model)
     droneEntity = ent
     return ent
 end
 
--- ─── Battery ─────────────────────────────────────────────────────────────────
--- Charge lives on the drone_battery item in the drone stash.
--- On deploy the server is asked for the current battery item and its slot.
--- Drain happens client-side and is saved to the stash item every 10 seconds.
--- When charge hits 0 the battery item is removed from the stash and the drone
--- powers down. The player must place a new drone_battery in the stash to resume.
+-- Battery
 
 startBatteryThread = function()
     if not batteryEnabled then return end
@@ -244,7 +383,7 @@ RegisterNetEvent('nzkfc_drone:receiveBattery', function(charge, slot)
     batteryReady = true
 end)
 
--- ─── Ground Drone (battery dead or removed) ─────────────────────────────────
+-- Ground Drone (battery dead or removed)
 -- Lands the drone, swaps to dead model, storage+pack targets only.
 -- Poll thread watches stash for a new battery and wakes drone when found.
 
@@ -255,6 +394,7 @@ local function landAndGround()
 
     droneGrounded = true
     healActive    = false
+    guardActive   = false
     droneStaying  = false
     droneActive   = false  -- stop main/battery threads before moving entity
 
@@ -280,7 +420,7 @@ local function landAndGround()
 
     SetEntityCoords(droneEntity, landPos.x, landPos.y, landPos.z, false, false, false, false)
     SetEntityRotation(droneEntity, 0.0, 0.0, GetEntityHeading(droneEntity), 2, true)
-
+    -- Freeze in place once grounded so physics can't push it around
     -- Swap to dead/powerless model
     swapDroneProp(Config.DroneDeadModel)
 
@@ -365,79 +505,89 @@ wakeUpDrone = function()
 
 end
 
--- ─── Damage Monitoring ───────────────────────────────────────────────────────
+-- Damage Monitoring
 
 startDamageThread = function()
     if damageThread then return end
+
+    -- Zero velocity every frame so bullet/explosion impulses don't move the drone.
+    CreateThread(function()
+        while droneActive and droneEntity and DoesEntityExist(droneEntity) and Config.DamageEnabled do
+            SetEntityVelocity(droneEntity, 0.0, 0.0, 0.0)
+            Wait(0)
+        end
+    end)
+
     damageThread = CreateThread(function()
-        -- Wait 2 frames so GTA fully registers the health pool after SetEntityCanBeDamaged(true).
-        -- Reading immediately returns 0 on a fresh prop, skewing all future diff calculations.
-        Wait(100)
-        local prevEntityHealth = GetEntityHealth(droneEntity)
+        -- Clear any stale hit flag from before this deploy.
+        ClearEntityLastDamageEntity(droneEntity)
 
-        while droneActive and droneEntity and DoesEntityExist(droneEntity) do
-            Wait(500)
+        while droneActive and droneEntity and DoesEntityExist(droneEntity) and Config.DamageEnabled do
+            Wait(100)
 
-            if not Config.DamageEnabled then
-                damageThread = nil
-                return
-            end
+            if not droneActive or not droneEntity or not DoesEntityExist(droneEntity) then break end
 
-            -- Re-check entity still exists and drone still active before reading health.
-            -- DeleteObject briefly sets entity health to 0 — without this guard a normal
-            -- pack-away would be misread as destruction.
-            if not droneActive or not droneEntity or not DoesEntityExist(droneEntity) then
-                damageThread = nil
-                return
-            end
+            -- HasEntityBeenDamagedByWeapon is reliable regardless of network ownership.
+            -- Fires once per hit; must be cleared to detect the next one.
+            if HasEntityBeenDamagedByWeapon(droneEntity, 0, 2) then
+                ClearEntityLastDamageEntity(droneEntity)
+                droneHealth = math.max(0, droneHealth - Config.DamagePerHit)
 
-            local curEntityHealth = GetEntityHealth(droneEntity)
-
-            -- Only ignore zero-health if the entity is also gone (pack-away race).
-            -- If entity still exists and droneActive is true, zero health is a real destruction.
-            if curEntityHealth == 0 and not DoesEntityExist(droneEntity) then
-                damageThread = nil
-                return
-            end
-
-            if curEntityHealth < prevEntityHealth then
-                local diff = prevEntityHealth - curEntityHealth
-                -- Scale GTA entity health loss to our drone HP pool
-                local dmg = math.floor((diff / 1000) * Config.DroneMaxHealth)
-                droneHealth = math.max(0, droneHealth - math.max(dmg, 10))
-                prevEntityHealth = curEntityHealth
-
-                lib.notify({ type = 'warning', title = 'Drone', description = ('Drone hit! Health: %d/%d'):format(droneHealth, Config.DroneMaxHealth) })
-                TriggerServerEvent('nzkfc_drone:saveHealth', droneSerial, droneHealth)
-            end
-
-            -- Check droneHealth outside the diff block — once entity health reaches 0
-            -- it stays at 0 so curEntityHealth < prevEntityHealth never fires again,
-            -- meaning the destroy check inside would never be reached.
-            if droneHealth <= 0 then
-                lib.notify({ type = 'error', title = 'Drone', description = 'Drone destroyed! Storage is still recoverable.' })
-                TriggerServerEvent('nzkfc_drone:destroyed', droneSerial)
-                TriggerEvent('nzkfc_drone:wreckDrone')
-                damageThread = nil
-                return
+                if droneHealth > 0 then
+                    lib.notify({ type = 'warning', title = 'Drone', description = ('Drone hit! Health: %d/%d'):format(droneHealth, Config.DroneMaxHealth) })
+                    TriggerServerEvent('nzkfc_drone:saveHealth', droneSerial, droneHealth)
+                else
+                    lib.notify({ type = 'error', title = 'Drone', description = 'Drone destroyed! Storage is still recoverable.' })
+                    TriggerServerEvent('nzkfc_drone:destroyed', droneSerial)
+                    TriggerEvent('nzkfc_drone:wreckDrone')
+                    damageThread = nil
+                    return
+                end
             end
         end
         damageThread = nil
     end)
 end
 
--- ─── Main Follow Thread ───────────────────────────────────────────────────────
+-- Main Follow Thread
 
 startMainThread = function()
     if mainThread then return end
 
-    startFlySound(droneEntity)
+    -- Sound already started during deploy kneel — no need to restart here.
+    -- Re-attach sound to entity in case it was lost (e.g. after battery wake).
+    if flySoundId == -1 then
+        startFlySound(droneEntity)
+    end
+
+    -- Broadcast position to other clients at ~20Hz so they can smoothly
+    -- interpolate instead of relying on NSA's ~10Hz snap updates.
+    local netId = NetworkGetNetworkIdFromEntity(droneEntity)
+    CreateThread(function()
+        while droneActive and droneEntity and DoesEntityExist(droneEntity) do
+            local p = GetEntityCoords(droneEntity)
+            local h = GetEntityHeading(droneEntity)
+            TriggerServerEvent('nzkfc_drone:broadcastPos', netId, p.x, p.y, p.z, h)
+            Wait(30) -- 33Hz
+        end
+    end)
 
     mainThread = CreateThread(function()
         local healTimer = 0  -- ticks since last heal fire
 
         while droneActive and droneEntity and DoesEntityExist(droneEntity) do
             Wait(0)
+
+            -- Re-assert network control every tick. Without this GTA can
+            -- migrate ownership to another client, causing their physics
+            -- engine to take over and pull the drone to the ground.
+            if not NetworkHasControlOfEntity(droneEntity) then
+                NetworkRequestControlOfEntity(droneEntity)
+            end
+            -- Zero velocity every tick to cancel any residual forces
+            -- (bullet impacts, collisions). Gravity is already disabled
+            -- on spawn so the drone stays at the Z we set via SetEntityCoords.
+            SetEntityVelocity(droneEntity, 0.0, 0.0, 0.0)
 
             -- Pause movement when drone is grounded (battery dead)
             if droneGrounded then
@@ -482,7 +632,7 @@ startMainThread = function()
     end)
 end
 
--- ─── Deploy ───────────────────────────────────────────────────────────────────
+-- Deploy
 
 local function deployDrone(itemMeta, slot)
     if droneActive then return end
@@ -522,6 +672,9 @@ local function deployDrone(itemMeta, slot)
 
     DroneMovement.Init(spawnPos, heading)
 
+    -- Start sound immediately so it plays during the kneel animation
+    startFlySound(droneEntity)
+
     -- Kneel animation (blocking) — drone sits on ground while player crouches
     kneelAnimation(Config.KneelDuration)
 
@@ -542,6 +695,9 @@ local function deployDrone(itemMeta, slot)
         local liftStart = GetEntityCoords(droneEntity)
         local steps     = 80  -- ~1.3s at 60fps
 
+        -- Request control before liftoff.
+        NetworkRequestControlOfEntity(droneEntity)
+
         for i = 1, steps do
             if not droneActive then break end
             -- Ease-in: starts slow, accelerates
@@ -555,7 +711,7 @@ local function deployDrone(itemMeta, slot)
             Wait(16)
         end
 
-        -- Hand off to normal follow thread
+        -- Hand off to normal follow thread (entity stays unfrozen during flight)
         startMainThread()
     end)
 
@@ -567,6 +723,30 @@ local function deployDrone(itemMeta, slot)
         -- onOpenStorage
         function()
             TriggerServerEvent('nzkfc_drone:openStorage', droneSerial, Config.StorageSlots, Config.StorageWeight)
+        end,
+
+        -- onGuard
+        function()
+            if guardActive then
+                guardActive = false
+                local sndId = GetSoundId()
+                PlaySoundFromEntity(sndId, Config.Sound.GuardDeactivate, droneEntity, Config.Sound.GuardDeactAudioRef, false, 0)
+                CreateThread(function()
+                    Wait(3000)
+                    ReleaseSoundId(sndId)
+                end)
+                lib.notify({ type = 'inform', title = 'Drone', description = 'Guard mode deactivated.' })
+            else
+                guardActive = true
+                -- Play turret activation sound
+                local sndId = GetSoundId()
+                PlaySoundFromEntity(sndId, Config.Sound.GuardActivate, droneEntity, Config.Sound.GuardAudioRef, false, 0)
+                CreateThread(function()
+                    Wait(3000)
+                    ReleaseSoundId(sndId)
+                end)
+                lib.notify({ type = 'error', title = 'Drone', description = 'Guard mode activated! Drone will fire on nearby threats.' })
+            end
         end,
 
         -- onHeal
@@ -626,29 +806,96 @@ local function deployDrone(itemMeta, slot)
                 description = ('Battery: %d%%'):format(pct),
                 icon        = 'fas ' .. icon,
             })
+        end,
+
+        -- onToggleSound
+        function()
+            flightSoundMuted = not flightSoundMuted
+            if flightSoundMuted then
+                stopFlySound()
+                lib.notify({ type = 'inform', title = 'Drone', description = 'Motor sound muted.' })
+            else
+                if droneEntity and DoesEntityExist(droneEntity) then
+                    startFlySound(droneEntity)
+                end
+                lib.notify({ type = 'inform', title = 'Drone', description = 'Motor sound enabled.' })
+            end
+        end,
+
+        -- onToggleLight
+        function()
+            droneLight = not droneLight
+            local state = droneLight and 'on' or 'off'
+            lib.notify({ type = 'inform', title = 'Drone', description = ('Spotlight %s.'):format(state) })
         end
     )
+
+    -- Spotlight draw thread
+    -- DrawSpotLight(pos, dir, r, g, b, distance, brightness, roundness, radius, falloff)
+    -- Attached forward of the entity, angled downward by Config.LightAngle degrees.
+    CreateThread(function()
+        -- Pre-compute the downward blend factor from config angle (tan of angle)
+        local tanAngle = math.tan(math.rad(Config.LightAngle))
+        while droneActive do
+            Wait(0)
+            if Config.LightEnabled and droneLight and droneEntity and DoesEntityExist(droneEntity) then
+                local pos = GetEntityCoords(droneEntity)
+                -- Derive true forward from logical heading (model has 180° visual offset)
+                local heading = math.rad(-(GetEntityHeading(droneEntity) - 180.0))
+                local fwdX = math.sin(heading)
+                local fwdY = math.cos(heading)
+                -- Origin: slightly in front and above the drone centre
+                local ox = pos.x + fwdX * 0.3
+                local oy = pos.y + fwdY * 0.3
+                local oz = pos.z + 0.1
+                -- Direction: forward blended downward by tan(angle), then normalised
+                local dlen = math.sqrt(fwdX*fwdX + fwdY*fwdY + tanAngle*tanAngle)
+                local dx = fwdX    / dlen
+                local dy = fwdY    / dlen
+                local dz = -tanAngle / dlen
+                DrawSpotLight(ox, oy, oz, dx, dy, dz,
+                    Config.LightR, Config.LightG, Config.LightB,
+                    Config.LightDistance, Config.LightBrightness, 0.0,
+                    Config.LightRadius, Config.LightFalloff)
+            end
+        end
+    end)
 
     -- Start battery and damage monitoring
     startBatteryThread()
     if Config.DamageEnabled then
-        -- Enable damage BEFORE starting the thread so prevEntityHealth is
-        -- captured after the entity has a real health pool (default 1000).
         SetEntityInvincible(droneEntity, false)
         SetEntityCanBeDamaged(droneEntity, true)
-        Wait(0)  -- one yield so GTA registers the health pool
         startDamageThread()
     end
+
+    -- Watch for player death — remove target menu while down, restore on respawn
+    CreateThread(function()
+        local wasDown = false
+        while droneActive do
+            Wait(500)
+            local down = IsPedDeadOrDying(PlayerPedId(), true)
+            if down and not wasDown then
+                wasDown = true
+                DroneTargeting.Remove()
+            elseif not down and wasDown then
+                wasDown = false
+                -- Re-add targets with the same callbacks that were set on deploy
+                DroneTargeting.SetGrounded(droneEntity, false)
+            end
+        end
+    end)
 
     lib.notify({ type = 'success', title = 'Drone', description = ('Drone deployed! [%s] HP: %d/%d'):format(droneSerial, droneHealth, Config.DroneMaxHealth) })
 end
 
--- ─── Undeploy ─────────────────────────────────────────────────────────────────
+-- Undeploy
 
 local function undeployDrone()
     if not droneActive then return end
     if droneWrecked then return end   -- wrecked drones cannot be packed away
     healActive    = false
+    guardActive   = false
     droneGrounded = false
 
     -- Stop control mode if active
@@ -673,11 +920,12 @@ local function undeployDrone()
     local landPos = vector3(landX, landY, landGZ + 0.1)
 
     lib.notify({ type = 'inform', title = 'Drone', description = 'Recalling drone...' })
-    stopFlySound()
 
+    -- Keep sound running through the glide and kneel — stop it last.
     -- Kill the follow/main thread first so it stops fighting the glide animation.
     -- droneActive=false stops all threads cleanly; we keep the entity alive for the glide.
     droneActive = false
+    droneLight  = false
     Wait(10)  -- one yield so threads see the flag before we start moving the entity
 
     -- Glide drone down to land position with ease-out curve (~1.2s)
@@ -708,12 +956,12 @@ local function undeployDrone()
     end
 
     deleteDroneProp()
-    stopFlySound()  -- call again after entity deleted — entity deletion + full undeploy duration should fully clear the audio tail
+    stopFlySound()  -- stop sound last, after prop is deleted and kneel is done
 
     lib.notify({ type = 'success', title = 'Drone', description = 'Drone packed away.' })
 end
 
--- ─── Wreck Drone (health reaches 0) ─────────────────────────────────────────
+-- Wreck Drone (health reaches 0)
 -- Swaps to wreck model, falls to ground, storage-only target.
 -- Notifies server to schedule prop cleanup after WreckCleanupMinutes.
 
@@ -723,6 +971,7 @@ AddEventHandler('nzkfc_drone:wreckDrone', function()
     droneWrecked  = true
     droneActive   = false
     healActive    = false
+    guardActive   = false
     droneGrounded = false
 
     stopFlySound()
@@ -742,7 +991,9 @@ AddEventHandler('nzkfc_drone:wreckDrone', function()
     local foundZ, groundZ = GetGroundZFor_3dCoord(pos.x, pos.y, pos.z, false)
     if not foundZ then groundZ = pedPos.z end
 
-    -- Fast fall to ground
+    -- Fast fall to ground — drive manually via SetEntityCoords.
+    -- Gravity is disabled so the fall speed is fully under our control.
+    NetworkRequestControlOfEntity(droneEntity)
     local startZ = pos.z
     local steps  = 20
     for i = 1, steps do
@@ -756,13 +1007,13 @@ AddEventHandler('nzkfc_drone:wreckDrone', function()
     SetEntityRotation(droneEntity, 0.0, 25.0, GetEntityHeading(droneEntity), 2, true)
 
     -- Storage-only target
-    DroneTargeting.SetWrecked(droneEntity)
+    DroneTargeting.SetWrecked(droneEntity, droneSerial)
 
     -- Tell server to schedule stash cleanup after WreckCleanupMinutes
     TriggerServerEvent('nzkfc_drone:scheduleWreckCleanup', droneSerial)
 end)
 
--- ─── Pack Drone (called from target option when grounded) ────────────────────
+-- Pack Drone (called from target option when grounded)
 
 local function packDrone()
     if not droneActive then return end
@@ -775,6 +1026,7 @@ local function packDrone()
     droneActive   = false
     droneGrounded = false
     healActive    = false
+    guardActive   = false
 
     deleteDroneProp()
     kneelAnimation(Config.KneelDuration)
@@ -784,7 +1036,7 @@ end
 -- Expose so targeting can call it
 _G.dronePackDrone = packDrone
 
--- ─── Force Undeploy (battery dead / destroyed) ────────────────────────────────
+-- Force Undeploy (battery dead / destroyed)
 
 AddEventHandler('nzkfc_drone:forceUndeploy', function()
     if not droneActive then return end
@@ -794,7 +1046,7 @@ AddEventHandler('nzkfc_drone:forceUndeploy', function()
     deleteDroneProp()
 end)
 
--- ─── /calldrone command ───────────────────────────────────────────────────────
+-- /calldrone command
 
 RegisterCommand('calldrone', function()
     if not droneActive then
@@ -810,7 +1062,7 @@ RegisterCommand('calldrone', function()
     end
 end, false)
 
--- ─── Item Use ─────────────────────────────────────────────────────────────────
+-- Item Use 
 -- When ox_inventory calls a client.export it passes ONE argument: the item data table.
 -- The slot number is at data.slot — there is no second argument.
 -- When using client.event it triggers a local event with the item data table as arg 1.
@@ -823,9 +1075,16 @@ local function handleItemUse(data)
     if droneWrecked and not droneActive then droneWrecked = false end
     if droneWrecked then return end
 
-    -- data is the full item table from ox_inventory
-    local slot     = data.slot
-    local metadata = data.metadata or {}
+    -- Job restriction check: only run on deploy attempt, not undeploy
+    if not droneActive and Config.JobRestrict and not Framework.hasJob(Config.JobRestrict) then
+        lib.notify({ type = 'error', title = 'Drone', description = 'You are not authorised to use this.' })
+        return
+    end
+
+    -- data is the full item table passed by ox_inventory's client event.
+    -- ox_inventory always includes slot and metadata for both ESX and QBX.
+    local slot     = data and data.slot
+    local metadata = (data and data.metadata) or {}
 
     if droneActive then
         undeployDrone()
@@ -851,14 +1110,14 @@ AddEventHandler('nzkfc_drone:useItem', function(data)
     handleItemUse(data)
 end)
 
--- ─── Serial assigned callback (fires after server generates a new serial) ────
+-- Serial assigned callback (fires after server generates a new serial)
 RegisterNetEvent('nzkfc_drone:serialAssigned', function(metadata)
     itemUseLock = false
     lib.notify({ type = 'success', title = 'Drone', description = 'Drone initialised: ' .. metadata.serial })
     deployDrone(metadata, droneItemSlot)
 end)
 
--- ─── Healing visual feedback helpers ─────────────────────────────────────────
+-- Healing visual feedback helpers
 
 -- Floating "+N" text that rises over the player's head and fades out
 local function spawnFloatingHealText(amount)
@@ -914,7 +1173,7 @@ local function spawnHealParticles(ped)
     RemoveNamedPtfxAsset(assetName)
 end
 
--- ─── Receive heal from server ────────────────────────────────────────────────
+-- Receive heal from server
 RegisterNetEvent('nzkfc_drone:applyHeal', function(amount)
     local ped       = PlayerPedId()
     local maxHealth = GetEntityMaxHealth(ped)
@@ -939,7 +1198,145 @@ RegisterNetEvent('nzkfc_drone:applyHeal', function(amount)
     end
 end)
 
--- ─── AOE Heal Zone Marker ────────────────────────────────────────────────────
+-- Guard Mode Thread
+-- Scans for targets in range and fires bullets from the drone position.
+
+local function isAnimal(ped)
+    -- GTA animal model hashes — check against common animal types
+    local animalModels = {
+        'a_c_deer', 'a_c_boar', 'a_c_cat_01', 'a_c_chickenhawk', 'a_c_chimp',
+        'a_c_cormorant', 'a_c_cow', 'a_c_coyote', 'a_c_crow', 'a_c_dolphin',
+        'a_c_fish', 'a_c_hen', 'a_c_husky', 'a_c_killerwhale', 'a_c_mtlion',
+        'a_c_pig', 'a_c_pigeon', 'a_c_poodle', 'a_c_pug', 'a_c_rabbit_01',
+        'a_c_rat', 'a_c_retriever', 'a_c_rhesus', 'a_c_rottweiler', 'a_c_seagull',
+        'a_c_shepherd', 'a_c_shark_hammerhead', 'a_c_shark_tiger', 'a_c_stingray',
+        'a_c_westy',
+    }
+    local model = GetEntityModel(ped)
+    for _, hash in ipairs(animalModels) do
+        if model == joaat(hash) then return true end
+    end
+    return false
+end
+
+CreateThread(function()
+    while true do
+        if not guardActive or not droneActive or not droneEntity or not DoesEntityExist(droneEntity) then
+            Wait(500)
+        else
+            local dronePos  = GetEntityCoords(droneEntity)
+            local myPed     = PlayerPedId()
+            local myPlayer  = PlayerId()
+            local weapon    = joaat(Config.GuardWeapon)
+
+            local function fireAt(targetPos)
+                -- Offset bullet origin to clear the prop in both directions.
+                -- Target below: fire from underside (-0.3)
+                -- Target above: fire from topside (+0.3)
+                local originZ = targetPos.z < dronePos.z
+                    and (dronePos.z - 0.3)
+                    or  (dronePos.z + 0.3)
+
+                local function shoot()
+                    ShootSingleBulletBetweenCoords(
+                        dronePos.x, dronePos.y, originZ,
+                        targetPos.x, targetPos.y, targetPos.z,
+                        Config.GuardDamage, true, weapon, myPed, true, false, 1000.0
+                    )
+                end
+
+                if Config.GuardAutomatic then
+                    shoot()
+                elseif Config.GuardBurst then
+                    for i = 1, Config.GuardBurstCount do
+                        shoot()
+                        Wait(80)
+                        if not guardActive then return end
+                        -- Refresh dronePos and originZ each burst shot since drone may have moved
+                        dronePos = GetEntityCoords(droneEntity)
+                        originZ  = targetPos.z < dronePos.z and (dronePos.z - 0.3) or dronePos.z
+                    end
+                else
+                    shoot()
+                end
+            end
+
+            local fired = false
+
+            -- Check players
+            if Config.GuardTargets.players then
+                for _, player in ipairs(GetActivePlayers()) do
+                    if not fired and player ~= myPlayer then
+                        local ped = GetPlayerPed(player)
+                        if ped and DoesEntityExist(ped) and not IsEntityDead(ped) then
+                            local dist = #(GetEntityCoords(ped) - dronePos)
+                            if dist <= Config.GuardRadius then
+                                fireAt(GetEntityCoords(ped))
+                                fired = true
+                            end
+                        end
+                    end
+                end
+            end
+
+            -- Check peds
+            if not fired and (Config.GuardTargets.peds or Config.GuardTargets.animals) then
+                for _, ped in ipairs(GetGamePool('CPed')) do
+                    if not fired and ped ~= myPed and not IsPedAPlayer(ped) and not IsEntityDead(ped) then
+                        local animal = isAnimal(ped)
+                        local shouldTarget = (animal and Config.GuardTargets.animals) or
+                                             (not animal and Config.GuardTargets.peds)
+                        if shouldTarget then
+                            local dist = #(GetEntityCoords(ped) - dronePos)
+                            if dist <= Config.GuardRadius then
+                                fireAt(GetEntityCoords(ped))
+                                fired = true
+                            end
+                        end
+                    end
+                end
+            end
+
+            Wait(Config.GuardFireRate)
+        end
+    end
+end)
+
+-- AOE Guard Zone Marker
+
+CreateThread(function()
+    local pulse    = 0.0
+    local pulseDir = 1
+
+    while true do
+        if not guardActive or not droneActive or not droneEntity or not DoesEntityExist(droneEntity) then
+            Wait(200)
+        else
+            local dronePos = GetEntityCoords(droneEntity)
+
+            pulse = pulse + (pulseDir * 0.008)
+            if pulse >= 1.0 then pulseDir = -1 end
+            if pulse <= 0.0 then pulseDir =  1 end
+            local alpha = math.floor(30 + (pulse * 50))
+
+            DrawMarker(
+                27,
+                dronePos.x, dronePos.y, dronePos.z - 2.0,
+                0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0,
+                Config.GuardRadius * 2.0,
+                Config.GuardRadius * 2.0,
+                0.3,
+                0, 100, 210, alpha,                         -- blue
+                false, false, 2, false, nil, nil, false
+            )
+
+            Wait(0)
+        end
+    end
+end)
+
+-- AOE Heal Zone Marker
 -- Draws a pulsing green cylinder under the drone showing the heal radius.
 -- Only visible when a player is within 2x the heal range.
 
@@ -977,7 +1374,7 @@ CreateThread(function()
     end
 end)
 
--- ─── Heal complete — server says nobody in range needs healing ───────────────
+-- Heal complete — server says nobody in range needs healing
 RegisterNetEvent('nzkfc_drone:healComplete', function()
     if healActive then
         healActive = false
@@ -992,7 +1389,7 @@ AddEventHandler('nzkfc_drone:openStorageFromTarget', function()
     end
 end)
 
--- ─── Cleanup on resource stop ────────────────────────────────────────────────
+-- Cleanup on resource stop
 AddEventHandler('onResourceStop', function(name)
     if name == GetCurrentResourceName() then
         stopFlySound()
@@ -1002,7 +1399,7 @@ AddEventHandler('onResourceStop', function(name)
     end
 end)
 
--- ─── Audio safety thread ─────────────────────────────────────────────────────
+-- Audio safety thread
 -- If the drone is not active/alive, ensure the fly sound is never running.
 -- Guards against orphaned audio from script restarts or edge-case crashes.
 CreateThread(function()
@@ -1012,6 +1409,28 @@ CreateThread(function()
             if flySoundId ~= -1 then
                 stopFlySound()
             end
+        end
+    end
+end)
+
+-- Disable ox_target while player is down/dead and drone is active
+-- Covers both framework states: isDown (downed/revivable) and isDead (respawning)
+CreateThread(function()
+    local wasDown = false
+    while true do
+        Wait(500)
+        if droneActive then
+            local down = Framework.isDown()
+            if down and not wasDown then
+                wasDown = true
+                exports.ox_target:disableTargeting(true)
+            elseif not down and wasDown then
+                wasDown = false
+                exports.ox_target:disableTargeting(false)
+            end
+        elseif wasDown then
+            wasDown = false
+            exports.ox_target:disableTargeting(false)
         end
     end
 end)

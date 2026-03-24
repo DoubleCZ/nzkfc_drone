@@ -1,9 +1,18 @@
+local ox_inventory = exports.ox_inventory
+
 local activeHealCooldowns = {}  -- [targetSrc] = timestamp
+
+-- Item Use Notes ─────────────────────────────────────────────────────────
+-- Item use is handled entirely through ox_inventory's items.lua.
+-- Both ESX and QBX use the same item config:
+--   client = { event = 'nzkfc_drone:useItem' }
+-- This fires the AddEventHandler('nzkfc_drone:useItem') on the client.
+-- No server-side ESX.RegisterUsableItem needed when using ox_inventory.
 
 -- Block drone items from being placed in any drone stash.
 -- itemFilter targets the item by name, inventoryFilter matches stash IDs by pattern.
 -- Returning false cancels the move.
-exports.ox_inventory:registerHook('swapItems', function(payload)
+ox_inventory:registerHook('swapItems', function(payload)
     -- Only block moves INTO a drone stash (toInventory matches), not out of it
     local toDest = payload.toInventory
     if type(toDest) == 'string' and toDest:sub(1, 11) == 'nzkfc_drone' then
@@ -15,23 +24,21 @@ end, {
     },
 })
 
--- ─── Drone Storage ────────────────────────────────────────────────────────────
+-- Drone Storage
 
 RegisterNetEvent('nzkfc_drone:openStorage', function(serial, slots, weight)
     local src     = source
     local stashId = 'nzkfc_drone_' .. serial
 
-    exports.ox_inventory:RegisterStash(stashId, 'Drone Storage [' .. serial .. ']', slots, weight)
+    ox_inventory:RegisterStash(stashId, 'Drone Storage [' .. serial .. ']', slots, weight)
     TriggerClientEvent('ox_inventory:openInventory', src, 'stash', stashId)
 end)
 
--- saveBattery is now handled via nzkfc_drone:saveBatteryToStash (charge lives on stash battery item)
-
--- ─── Drone Health: Save to item metadata ─────────────────────────────────────
+-- Drone Health: Save to item metadata
 
 RegisterNetEvent('nzkfc_drone:saveHealth', function(serial, health)
     local src   = source
-    local items = exports.ox_inventory:GetInventoryItems(src)
+    local items = ox_inventory:GetInventoryItems(src)
     if not items then return end
 
     for slot, item in pairs(items) do
@@ -39,25 +46,25 @@ RegisterNetEvent('nzkfc_drone:saveHealth', function(serial, health)
             local meta = item.metadata or {}
             if meta.serial == serial then
                 meta.health = math.max(0, math.floor(health))
-                exports.ox_inventory:SetMetadata(src, slot, meta)
+                ox_inventory:SetMetadata(src, slot, meta)
                 break
             end
         end
     end
 end)
 
--- ─── Drone Destroyed: Remove item from player ────────────────────────────────
+-- Drone Destroyed: Remove item from player
 
 RegisterNetEvent('nzkfc_drone:destroyed', function(serial)
     local src   = source
-    local items = exports.ox_inventory:GetInventoryItems(src)
+    local items = ox_inventory:GetInventoryItems(src)
     if not items then return end
 
     for slot, item in pairs(items) do
         if item and item.name == Config.DroneItem then
             local meta = item.metadata or {}
             if meta.serial == serial then
-                exports.ox_inventory:RemoveItem(src, Config.DroneItem, 1, nil, slot)
+                ox_inventory:RemoveItem(src, Config.DroneItem, 1, nil, slot)
                 TriggerClientEvent('ox_lib:notify', src, {
                     type        = 'error',
                     title       = 'Drone',
@@ -69,7 +76,7 @@ RegisterNetEvent('nzkfc_drone:destroyed', function(serial)
     end
 end)
 
--- ─── Healing ─────────────────────────────────────────────────────────────────
+-- Healing
 
 RegisterNetEvent('nzkfc_drone:healNearby', function(droneCoords)
     local src     = source
@@ -100,7 +107,7 @@ RegisterNetEvent('nzkfc_drone:healComplete', function()
     TriggerClientEvent('nzkfc_drone:healComplete', src)
 end)
 
--- ─── Generate Serial Number ───────────────────────────────────────────────────
+-- Generate Serial Number
 
 RegisterNetEvent('nzkfc_drone:generateSerial', function(slot)
     local src    = source
@@ -112,27 +119,27 @@ RegisterNetEvent('nzkfc_drone:generateSerial', function(slot)
         return
     end
 
-    local item = exports.ox_inventory:GetSlot(src, slot)
+    local item = ox_inventory:GetSlot(src, slot)
 
     if item and item.name == Config.DroneItem then
         local meta = item.metadata or {}
         if not meta.serial then
             meta.serial = serial
             meta.health = Config.DroneMaxHealth
-            -- Store serial in label so it shows in inventory e.g. "Drone [DRN-123456]"
             meta.label  = 'Drone [' .. serial .. ']'
-            exports.ox_inventory:SetMetadata(src, slot, meta)
+            ox_inventory:SetMetadata(src, slot, meta)
 
-            -- First time setup: register stash and seed with a full battery
             local stashId = 'nzkfc_drone_' .. serial
-            exports.ox_inventory:RegisterStash(stashId, 'Drone [' .. serial .. '] Storage', Config.StorageSlots, Config.StorageWeight)
-            exports.ox_inventory:AddItem(stashId, Config.BatteryItem, 1, { charge = 100 })
+            ox_inventory:RegisterStash(stashId, 'Drone [' .. serial .. '] Storage', Config.StorageSlots, Config.StorageWeight)
+            ox_inventory:AddItem(stashId, Config.BatteryItem, 1, {
+                charge = 100,
+                label  = 'Drone Battery (100%)',
+            })
 
             TriggerClientEvent('nzkfc_drone:serialAssigned', src, meta)
         else
-            -- Serial already exists — re-register stash in case server restarted
             local stashId = 'nzkfc_drone_' .. meta.serial
-            exports.ox_inventory:RegisterStash(stashId, 'Drone [' .. meta.serial .. '] Storage', Config.StorageSlots, Config.StorageWeight)
+            ox_inventory:RegisterStash(stashId, 'Drone [' .. meta.serial .. '] Storage', Config.StorageSlots, Config.StorageWeight)
             TriggerClientEvent('nzkfc_drone:serialAssigned', src, meta)
         end
     else
@@ -144,12 +151,12 @@ RegisterNetEvent('nzkfc_drone:generateSerial', function(slot)
     end
 end)
 
--- ─── Battery: Get battery item from drone stash ───────────────────────────────
+-- Battery: Get battery item from drone stash
 
 RegisterNetEvent('nzkfc_drone:getBattery', function(serial)
     local src     = source
     local stashId = 'nzkfc_drone_' .. serial
-    local items   = exports.ox_inventory:GetInventoryItems(stashId)
+    local items   = ox_inventory:GetInventoryItems(stashId)
     local battery = nil
     local battSlot = nil
 
@@ -164,23 +171,36 @@ RegisterNetEvent('nzkfc_drone:getBattery', function(serial)
     end
 
     if battery then
-        local charge = (battery.metadata and battery.metadata.charge) or 100
+        local charge = (battery.metadata and battery.metadata.charge)
+
+        if charge == nil then
+            charge = 100
+            ox_inventory:SetMetadata(stashId, battSlot, {
+                charge = 100,
+                label  = 'Drone Battery (100%)',
+            })
+        end
+
         TriggerClientEvent('nzkfc_drone:receiveBattery', src, charge, battSlot)
     else
         TriggerClientEvent('nzkfc_drone:receiveBattery', src, nil, nil)
     end
 end)
 
--- ─── Battery: Save charge to battery item in stash ───────────────────────────
+-- Battery: Save charge to battery item in stash
 
 RegisterNetEvent('nzkfc_drone:saveBatteryToStash', function(serial, charge, battSlot)
-    local stashId = 'nzkfc_drone_' .. serial
+    local stashId  = 'nzkfc_drone_' .. serial
     if battSlot then
-        exports.ox_inventory:SetMetadata(stashId, battSlot, { charge = math.max(0, math.floor(charge)) })
+        local stored = math.max(0, math.floor(charge))
+        ox_inventory:SetMetadata(stashId, battSlot, {
+            charge = stored,
+            label  = ('Drone Battery (%d%%)'):format(stored),
+        })
     end
 end)
 
--- ─── Battery: Drain battery — swap drone_battery → drone_battery_empty ──────
+-- Battery: Drain battery — swap drone_battery → drone_battery_empty
 -- The empty item stays in the stash so the player can see/remove it.
 -- ox_inventory has no direct "swap item" — remove charged, add empty.
 
@@ -188,15 +208,12 @@ RegisterNetEvent('nzkfc_drone:drainBattery', function(serial, battSlot)
     local stashId = 'nzkfc_drone_' .. serial
     if not battSlot then return end
 
-    -- Remove the charged battery
-    exports.ox_inventory:RemoveItem(stashId, Config.BatteryItem, 1, nil, battSlot)
-    -- Add the empty battery in its place
-    exports.ox_inventory:AddItem(stashId, Config.BatteryEmptyItem, 1)
+    ox_inventory:RemoveItem(stashId, Config.BatteryItem, 1, nil, battSlot)
+
+    ox_inventory:AddItem(stashId, Config.BatteryEmptyItem, 1)
 end)
 
--- ─── Wreck Cleanup: clear stash after WreckCleanupMinutes ───────────────────
--- When a drone is destroyed the client fires this. The server waits the configured
--- time then wipes the stash so the drone is permanently gone.
+-- Wreck Cleanup: clear stash after WreckCleanupMinutes
 
 RegisterNetEvent('nzkfc_drone:scheduleWreckCleanup', function(serial)
     local src     = source
@@ -204,12 +221,11 @@ RegisterNetEvent('nzkfc_drone:scheduleWreckCleanup', function(serial)
     local waitMs  = Config.WreckCleanupMinutes * 60 * 1000
 
     SetTimeout(waitMs, function()
-        -- Clear all items from the stash
-        local items = exports.ox_inventory:GetInventoryItems(stashId)
+        local items = ox_inventory:GetInventoryItems(stashId)
         if items then
             for slot, item in pairs(items) do
                 if item then
-                    exports.ox_inventory:RemoveItem(stashId, item.name, item.count or 1, nil, slot)
+                    ox_inventory:RemoveItem(stashId, item.name, item.count or 1, nil, slot)
                 end
             end
         end
@@ -217,3 +233,58 @@ RegisterNetEvent('nzkfc_drone:scheduleWreckCleanup', function(serial)
     end)
 end)
 
+
+-- Drone Sound: Relay to other nearby players
+
+RegisterNetEvent('nzkfc_drone:startSound', function(netId)
+    local src = source
+    for _, playerId in ipairs(GetPlayers()) do
+        playerId = tonumber(playerId)
+        if playerId ~= src then
+            TriggerClientEvent('nzkfc_drone:playRemoteSound', playerId, netId)
+        end
+    end
+end)
+
+RegisterNetEvent('nzkfc_drone:stopSound', function(netId)
+    local src = source
+    for _, playerId in ipairs(GetPlayers()) do
+        playerId = tonumber(playerId)
+        if playerId ~= src then
+            TriggerClientEvent('nzkfc_drone:stopRemoteSound', playerId, netId)
+        end
+    end
+end)
+
+-- Wreck: Broadcast to all other clients so they can loot the drone
+
+RegisterNetEvent('nzkfc_drone:broadcastWreck', function(netId, serial)
+    local src = source
+    for _, playerId in ipairs(GetPlayers()) do
+        playerId = tonumber(playerId)
+        if playerId ~= src then
+            TriggerClientEvent('nzkfc_drone:registerWreckTarget', playerId, netId, serial)
+        end
+    end
+end)
+
+-- Guest Storage: Non-owner opens a wrecked drone stash
+
+RegisterNetEvent('nzkfc_drone:openStorageAsGuest', function(serial)
+    local src     = source
+    local stashId = 'nzkfc_drone_' .. serial
+    ox_inventory:RegisterStash(stashId, 'Drone Storage [' .. serial .. ']', Config.StorageSlots, Config.StorageWeight)
+    TriggerClientEvent('ox_inventory:openInventory', src, 'stash', stashId)
+end)
+
+-- Position Sync: Relay owner position to other clients for smooth lerp
+
+RegisterNetEvent('nzkfc_drone:broadcastPos', function(netId, x, y, z, h)
+    local src = source
+    for _, playerId in ipairs(GetPlayers()) do
+        playerId = tonumber(playerId)
+        if playerId ~= src then
+            TriggerClientEvent('nzkfc_drone:recvPos', playerId, netId, x, y, z, h)
+        end
+    end
+end)

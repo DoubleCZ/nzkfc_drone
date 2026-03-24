@@ -1,8 +1,8 @@
 DroneTargeting = {}
 
-local currentEntity = nil  -- track the entity handle so we can remove targets later
+local currentEntity = nil
 
-_G.droneDoingTrick = false  -- global flag so main.lua can pause the movement thread
+_G.droneDoingTrick = false
 
 local function playDroneTrick(droneEntity)
     if _G.droneDoingTrick then return end
@@ -62,37 +62,91 @@ end
 
 local storedCallbacks = nil  -- saved so SetGrounded(false) can restore full options
 
-function DroneTargeting.Add(droneEntity, droneSerial, onOpenStorage, onHeal, onStay, onControl, onBattery)
-    -- Clean up any previous target registration first
+-- Refresh: re-registers all targets on the current entity so ox_target
+-- re-evaluates canInteract with the player's updated job.
+-- Called automatically when the player's job changes while the drone is deployed.
+function DroneTargeting.Refresh()
+    if not currentEntity or not storedCallbacks then return end
+    -- Capture refs before Remove() nils currentEntity
+    local entity    = currentEntity
+    local callbacks = storedCallbacks
+    -- Only remove the options registered during normal flight.
+    -- nzkfc_drone_pack and nzkfc_drone_wrecked_storage are only added in
+    -- grounded/wrecked states so trying to remove them here causes ox_target
+    -- to warn 'attempted to remove a zone that does not exist'.
+    exports.ox_target:removeLocalEntity(entity, {
+        'nzkfc_drone_storage',
+        'nzkfc_drone_battery',
+        'nzkfc_drone_guard',
+        'nzkfc_drone_heal',
+        'nzkfc_drone_control',
+        'nzkfc_drone_flip',
+        'nzkfc_drone_stay',
+        'nzkfc_drone_sound',
+        'nzkfc_drone_light',
+    })
+    currentEntity = nil
+    -- Re-add on next tick so ox_target fully processes the removal first
+    CreateThread(function()
+        Wait(0)
+        currentEntity = entity
+        storedCallbacks = callbacks
+        DroneTargeting.Add(
+            entity, nil,
+            callbacks.onOpenStorage,
+            callbacks.onGuard,
+            callbacks.onHeal,
+            callbacks.onStay,
+            callbacks.onControl,
+            callbacks.onBattery,
+            callbacks.onToggleSound,
+            callbacks.onToggleLight
+        )
+    end)
+end
+
+function DroneTargeting.Add(droneEntity, droneSerial, onOpenStorage, onGuard, onHeal, onStay, onControl, onBattery, onToggleSound, onToggleLight)
     if currentEntity then
         DroneTargeting.Remove()
     end
 
     currentEntity = droneEntity
 
-    -- Store callbacks so we can restore them after waking from grounded/dead state
-    storedCallbacks = { onOpenStorage = onOpenStorage, onHeal = onHeal, onStay = onStay, onControl = onControl, onBattery = onBattery }
+    storedCallbacks = { onOpenStorage = onOpenStorage, onGuard = onGuard, onHeal = onHeal, onStay = onStay, onControl = onControl, onBattery = onBattery, onToggleSound = onToggleSound, onToggleLight = onToggleLight }
 
     exports.ox_target:addLocalEntity(droneEntity, {
         {
+            name        = 'nzkfc_drone_storage',
+            icon        = 'fas fa-box-open',
+            label       = 'Drone Storage',
+            distance    = 2.5,
+            canInteract = function() return not Framework.isDown() and Framework.canUseOption('nzkfc_drone_storage') end,
+            onSelect    = function()
+                onOpenStorage()
+            end,
+        },
+		{
             name     = 'nzkfc_drone_battery',
             icon     = 'fas fa-battery-half',
             label    = 'Check Battery',
             distance = 2.5,
             canInteract = function()
-                return Config.BatteryEnabled
+                return Config.BatteryEnabled and not Framework.isDown() and Framework.canUseOption('nzkfc_drone_battery')
             end,
             onSelect = function()
                 onBattery()
             end,
         },
         {
-            name     = 'nzkfc_drone_storage',
-            icon     = 'fas fa-box-open',
-            label    = 'Drone Storage',
-            distance = 2.5,
-            onSelect = function()
-                onOpenStorage()
+            name        = 'nzkfc_drone_guard',
+            icon        = 'fas fa-shield-halved',
+            label       = 'Guard Mode',
+            distance    = 2.5,
+            canInteract = function()
+                return Config.GuardEnabled and not Framework.isDown() and Framework.canUseOption('nzkfc_drone_guard')
+            end,
+            onSelect    = function()
+                onGuard()
             end,
         },
         {
@@ -101,38 +155,66 @@ function DroneTargeting.Add(droneEntity, droneSerial, onOpenStorage, onHeal, onS
             label       = 'Activate Healing',
             distance    = 2.5,
             canInteract = function()
-                return Config.HealEnabled
+                return Config.HealEnabled and not Framework.isDown() and Framework.canUseOption('nzkfc_drone_heal')
             end,
             onSelect    = function()
                 onHeal()
             end,
-        },
+        },     
         {
-            name     = 'nzkfc_drone_flip',
-            icon     = 'fas fa-wand-magic-sparkles',
-            label    = 'Drone Flip',
-            distance = 2.5,
-            onSelect = function()
-                -- lib.notify({ type = 'inform', title = 'Drone', description = 'Sick moves!' })
-                playDroneTrick(droneEntity)
+            name        = 'nzkfc_drone_control',
+            icon        = 'fas fa-gamepad',
+            label       = 'Take Control',
+            distance    = 2.5,
+            canInteract = function() return not Framework.isDown() and Framework.canUseOption('nzkfc_drone_control') end,
+            onSelect    = function()
+                onControl()
             end,
         },
-        {
-            name     = 'nzkfc_drone_stay',
-            icon     = 'fas fa-map-pin',
-            label    = 'Tell Drone to Stay',
-            distance = 2.5,
-            onSelect = function()
+		{
+            name        = 'nzkfc_drone_flip',
+            icon        = 'fas fa-wand-magic-sparkles',
+            label       = 'Drone Flip',
+            distance    = 2.5,
+            canInteract = function() return not Framework.isDown() and Framework.canUseOption('nzkfc_drone_flip') end,
+            onSelect    = function()
+                local sndId = GetSoundId()
+                PlaySoundFromEntity(sndId, Config.Sound.FlipSound, droneEntity, Config.Sound.FlipAudioRef, false, 0)
+                CreateThread(function()
+                    Wait(5000)
+                    ReleaseSoundId(sndId)
+                end)
+                playDroneTrick(droneEntity)
+            end,
+        }, 
+		{
+            name        = 'nzkfc_drone_stay',
+            icon        = 'fas fa-map-pin',
+            label       = 'Tell Drone to Stay',
+            distance    = 2.5,
+            canInteract = function() return not Framework.isDown() and Framework.canUseOption('nzkfc_drone_stay') end,
+            onSelect    = function()
                 onStay()
             end,
         },
+		{
+            name        = 'nzkfc_drone_sound',
+            icon        = 'fas fa-volume-xmark',
+            label       = 'Toggle Motor Sound',
+            distance    = 2.5,
+            canInteract = function() return not Framework.isDown() and Framework.canUseOption('nzkfc_drone_sound') end,
+            onSelect    = function()
+                onToggleSound()
+            end,
+        },
         {
-            name     = 'nzkfc_drone_control',
-            icon     = 'fas fa-gamepad',
-            label    = 'Take Control',
-            distance = 2.5,
-            onSelect = function()
-                onControl()
+            name        = 'nzkfc_drone_light',
+            icon        = 'fas fa-lightbulb',
+            label       = 'Toggle Spotlight',
+            distance    = 2.5,
+            canInteract = function() return Config.LightEnabled and not Framework.isDown() and Framework.canUseOption('nzkfc_drone_light') end,
+            onSelect    = function()
+                onToggleLight()
             end,
         },
     })
@@ -142,20 +224,22 @@ end
 function DroneTargeting.SetGrounded(entity, grounded)
     if not entity then return end
 
-    -- Remove all current options including wrecked state
+    -- Remove only the flight options (the ones Add() registers).
+    -- nzkfc_drone_pack is only added while grounded, nzkfc_drone_wrecked_storage
+    -- only while wrecked — removing them here would trigger the missing zone warning.
     exports.ox_target:removeLocalEntity(entity, {
-        'nzkfc_drone_battery',
         'nzkfc_drone_storage',
+        'nzkfc_drone_battery',
+        'nzkfc_drone_guard',
         'nzkfc_drone_heal',
+        'nzkfc_drone_control',
         'nzkfc_drone_flip',
         'nzkfc_drone_stay',
-        'nzkfc_drone_control',
-        'nzkfc_drone_pack',
-        'nzkfc_drone_wrecked_storage',
+        'nzkfc_drone_sound',
+        'nzkfc_drone_light',
     })
 
     if grounded then
-        -- Only show Pack Drone when battery dead and sitting on ground
         exports.ox_target:addLocalEntity(entity, {
             {
                 name     = 'nzkfc_drone_storage',
@@ -175,30 +259,41 @@ function DroneTargeting.SetGrounded(entity, grounded)
         if storedCallbacks then
             DroneTargeting.Add(entity, nil,
                 storedCallbacks.onOpenStorage,
+                storedCallbacks.onGuard,
                 storedCallbacks.onHeal,
                 storedCallbacks.onStay,
                 storedCallbacks.onControl,
-                storedCallbacks.onBattery
+                storedCallbacks.onBattery,
+                storedCallbacks.onToggleSound,
+                storedCallbacks.onToggleLight
             )
         end
     end
 end
 
--- Wrecked state: drone destroyed, only storage accessible, nothing else
-function DroneTargeting.SetWrecked(entity)
+-- Wrecked state: drone destroyed, storage accessible to ALL players.
+-- Uses addEntity (networked) so other clients can loot the wreck.
+-- The server broadcasts the netId so every client can register the target.
+function DroneTargeting.SetWrecked(entity, serial)
     if not entity then return end
 
+    -- Remove flight options. nzkfc_drone_pack may or may not exist (only added
+    -- when grounded) so we include it here since wreck can follow grounded state.
+    -- nzkfc_drone_wrecked_storage won't exist yet so we don't try to remove it.
     exports.ox_target:removeLocalEntity(entity, {
-        'nzkfc_drone_battery',
         'nzkfc_drone_storage',
+        'nzkfc_drone_battery',
+        'nzkfc_drone_guard',
         'nzkfc_drone_heal',
+        'nzkfc_drone_control',
         'nzkfc_drone_flip',
         'nzkfc_drone_stay',
-        'nzkfc_drone_control',
+        'nzkfc_drone_sound',
+        'nzkfc_drone_light',
         'nzkfc_drone_pack',
-        'nzkfc_drone_wrecked_storage',
     })
 
+    -- Owner still gets a local target (fastest path)
     exports.ox_target:addLocalEntity(entity, {
         {
             name     = 'nzkfc_drone_wrecked_storage',
@@ -210,19 +305,57 @@ function DroneTargeting.SetWrecked(entity)
             end,
         },
     })
+
+    -- Broadcast netId + serial to all other clients so they can register
+    -- a target on the networked entity and loot the wreck too
+    local netId = NetworkGetNetworkIdFromEntity(entity)
+    TriggerServerEvent('nzkfc_drone:broadcastWreck', netId, serial)
 end
+
+-- Called on non-owner clients when a nearby drone is wrecked
+RegisterNetEvent('nzkfc_drone:registerWreckTarget', function(netId, serial)
+    -- Wait for the entity to be streamed in
+    CreateThread(function()
+        local entity = nil
+        local t = 0
+        while t < 100 do
+            entity = NetworkGetEntityFromNetworkId(netId)
+            if entity and entity ~= 0 and DoesEntityExist(entity) then break end
+            Wait(100)
+            t = t + 1
+        end
+        if not entity or not DoesEntityExist(entity) then return end
+
+        exports.ox_target:addLocalEntity(entity, {
+            {
+                name     = 'nzkfc_drone_wrecked_storage',
+                icon     = 'fas fa-box-open',
+                label    = 'Recover Storage',
+                distance = 2.5,
+                onSelect = function()
+                    -- Non-owner opens stash via server event with the serial
+                    TriggerServerEvent('nzkfc_drone:openStorageAsGuest', serial)
+                end,
+            },
+        })
+    end)
+end)
 
 function DroneTargeting.Remove()
     if currentEntity then
+        -- Remove only the standard flight options that Add() registers.
+        -- pack and wrecked_storage are state-specific and handled by their
+        -- own transitions — including them here causes the missing zone warning.
         exports.ox_target:removeLocalEntity(currentEntity, {
-            'nzkfc_drone_battery',
             'nzkfc_drone_storage',
+            'nzkfc_drone_battery',
+            'nzkfc_drone_guard',
             'nzkfc_drone_heal',
+            'nzkfc_drone_control',
             'nzkfc_drone_flip',
             'nzkfc_drone_stay',
-            'nzkfc_drone_control',
-            'nzkfc_drone_pack',
-            'nzkfc_drone_wrecked_storage',
+            'nzkfc_drone_sound',
+            'nzkfc_drone_light',
         })
         currentEntity = nil
     end
